@@ -1,0 +1,668 @@
+# Nodex Matrix - Adafruit Matrix Portal S3 + 64x64 HUB75 RGB LED matrix
+# https://github.com/TPS505/Nodex-Matrix
+#
+# Hardware notes
+#   * 64x64 panels need the address "E" line: solder the E jumper on the back of
+#     the Matrix Portal S3 to pin 8. If the bottom half of the panel mirrors the
+#     top half, the jumper isn't closed.
+#   * Power the panel from its own 5V supply; full white draws several amps.
+
+substitutions:
+  name: nodex-matrix
+  friendly_name: Nodex Matrix
+  timezone: Europe/London            # used until Home Assistant supplies its own
+  panel_width: 64
+  panel_height: 64
+  panel_rotation: 0                  # 0, 90, 180 or 270
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  name_add_mac_suffix: true          # unique per unit, e.g. nodex-matrix-a1b2c3
+  min_version: 2026.9.0
+  comment: Adafruit Matrix Portal S3 with a 64x64 HUB75 LED matrix
+  project:
+    name: nodexdevices.matrix-display
+    version: "1.0.0"
+
+esp32:
+  board: adafruit_matrixportal_esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # The panel's DMA buffers and BLE leave little internal RAM; let TLS
+      # (firmware update checks) allocate from PSRAM instead.
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: y
+
+psram:
+  mode: quad
+  speed: 80MHz
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  id: api_server
+  # No shared key: Home Assistant sets one on first connection. It is stored in
+  # flash; only a factory reset clears it.
+  encryption: {}
+  reboot_timeout: 0s                 # the display is useful without Home Assistant
+  actions:
+    # Full-screen message for a while, e.g. "Washing done".
+    - action: show_notification
+      variables:
+        message: string
+        seconds: int
+      then:
+        - lambda: |-
+            id(notify_text) = message;
+            const int32_t secs = std::max<int32_t>(1, std::min<int32_t>(seconds, 3600));
+            id(notify_until) = millis() + (uint32_t) secs * 1000;
+    - action: clear_notification
+      then:
+        - lambda: id(notify_until) = 0;
+    # Info screen: a title and up to 6 label/value rows (index 0-5).
+    - action: set_info_title
+      variables:
+        title: string
+      then:
+        - lambda: id(info_title) = title;
+    - action: set_tile
+      variables:
+        index: int
+        label: string
+        value: string
+      then:
+        - lambda: |-
+            if (index < 0 || index >= (int32_t) id(tile_labels).size())
+              return;
+            id(tile_labels)[index] = label;
+            id(tile_values)[index] = value;
+    - action: clear_tiles
+      then:
+        - lambda: |-
+            for (auto &s : id(tile_labels)) s.clear();
+            for (auto &s : id(tile_values)) s.clear();
+
+ota:
+  - platform: esphome
+  - platform: http_request           # lets the device install updates you publish
+
+http_request:
+
+# Shows "Firmware update available" in Home Assistant when you publish a new version
+update:
+  - platform: http_request
+    name: Firmware
+    source: https://raw.githubusercontent.com/TPS505/Nodex-Matrix/main/docs/firmware/manifest.json
+    update_interval: 6h
+
+dashboard_import:
+  package_import_url: github://TPS505/Nodex-Matrix/nodex-matrix.yaml@main
+  import_full_config: true
+
+wifi:
+  id: wifi_component
+  ap:
+    ssid: "Nodex Matrix Setup"
+  on_connect:
+    - lambda: id(connected_at) = millis();
+captive_portal:
+improv_serial:                       # Wi-Fi setup over USB
+esp32_improv:                        # Wi-Fi setup over Bluetooth (Home Assistant app)
+  authorizer: none
+
+# Setup (Wi-Fi hotspot, Bluetooth, Home Assistant key) has to finish within this
+# time of power-on; unplug and replug to try again.
+provisioning:
+  timeout: 15min
+  on_timeout:
+    then:
+      - globals.set:
+          id: provisioning_closed
+          value: "true"
+      - logger.log:
+          level: WARN
+          format: "Setup window closed; power cycle the device to set it up"
+
+web_server:
+  version: 3
+
+time:
+  - platform: homeassistant
+    id: ha_time
+  - platform: sntp
+    id: sntp_time
+    timezone: ${timezone}
+
+globals:
+  # Theme colour, written by the "Theme colour" light (0..1 per channel).
+  - id: theme_r
+    type: float
+    initial_value: "1.0"
+  - id: theme_g
+    type: float
+    initial_value: "1.0"
+  - id: theme_b
+    type: float
+    initial_value: "1.0"
+  # Notification pushed through the API.
+  - id: notify_text
+    type: std::string
+  - id: notify_until
+    type: uint32_t
+    initial_value: "0"
+  # Info screen contents, pushed through the API (not kept across reboots).
+  - id: info_title
+    type: std::string
+    initial_value: '"INFO"'
+  - id: tile_labels
+    type: std::vector<std::string>
+    initial_value: std::vector<std::string>(6)
+  - id: tile_values
+    type: std::vector<std::string>
+    initial_value: std::vector<std::string>(6)
+  # millis() when Wi-Fi last connected; drives the "connected" splash.
+  - id: connected_at
+    type: uint32_t
+    initial_value: "0"
+  # millis() when DOWN was pressed (0 = not held); drives the reset countdown.
+  - id: down_held_since
+    type: uint32_t
+    initial_value: "0"
+  - id: provisioning_closed
+    type: bool
+    initial_value: "false"
+
+font:
+  # Tiny5 is drawn on a pixel grid, so multiples of 8px render crisp at 1bpp.
+  - file: "gfonts://Tiny5"
+    id: font_small
+    size: 8
+    glyphsets: [GF_Latin_Core]
+    ignore_missing_glyphs: true
+  - file: "gfonts://Tiny5"
+    id: font_medium
+    size: 16
+    glyphsets: [GF_Latin_Core]
+    ignore_missing_glyphs: true
+  - file: "gfonts://Tiny5"
+    id: font_large
+    size: 24
+    glyphsets: [GF_Latin_Core]
+    ignore_missing_glyphs: true
+
+qr_code:
+  - id: setup_qr                     # joins the setup hotspot
+    value: "WIFI:T:nopass;S:Nodex Matrix Setup;;"
+    ecc: LOW
+
+display:
+  - platform: hub75
+    id: matrix
+    board: adafruit-matrix-portal-s3
+    panel_width: ${panel_width}
+    panel_height: ${panel_height}
+    rotation: ${panel_rotation}
+    double_buffer: true
+    brightness: 128
+    # Frames are pushed by the interval below so the panel refresh rate is
+    # independent of the animation rate.
+    update_interval: never
+    min_refresh_rate: 120
+    lambda: |-
+      const int W = it.get_width();
+      const int H = it.get_height();
+      const int CX = W / 2;
+      const uint32_t now = millis();
+
+      // ---- helpers ----------------------------------------------------------
+      auto scale = [](Color c, float f) -> Color {
+        return Color((uint8_t) (c.r * f), (uint8_t) (c.g * f), (uint8_t) (c.b * f));
+      };
+      Color theme = Color((uint8_t) (id(theme_r) * 255), (uint8_t) (id(theme_g) * 255),
+                          (uint8_t) (id(theme_b) * 255));
+      if (theme.r < 8 && theme.g < 8 && theme.b < 8)
+        theme = Color(255, 255, 255);
+      const Color white = Color(255, 255, 255);
+      const Color grey = Color(110, 110, 110);
+      const Color amber = Color(255, 140, 0);
+      const Color red = Color(255, 40, 20);
+
+      // Single-line text: centred when it fits, otherwise scrolls right-to-left.
+      auto marquee = [&](font::Font *f, const std::string &text, int y, Color c) {
+        int x1, y1, tw, th;
+        it.get_text_bounds(0, 0, text.c_str(), f, TextAlign::TOP_LEFT, &x1, &y1, &tw, &th);
+        if (tw <= W) {
+          it.print(CX, y, f, c, TextAlign::TOP_CENTER, text.c_str());
+          return;
+        }
+        const int span = tw + W / 2;
+        const int offset = (int) ((now / 30) % (uint32_t) span);
+        it.print(W - offset, y, f, c, TextAlign::TOP_LEFT, text.c_str());
+        // Second copy so the loop is seamless.
+        it.print(W - offset + span, y, f, c, TextAlign::TOP_LEFT, text.c_str());
+      };
+      auto upper = [](std::string s) {
+        for (auto &ch : s)
+          ch = toupper((unsigned char) ch);
+        return s;
+      };
+
+      // ---- factory reset countdown (hold DOWN) -------------------------------
+      if (id(down_held_since) != 0 && now - id(down_held_since) > 2000) {
+        const int left = 10 - (int) ((now - id(down_held_since)) / 1000);
+        it.rectangle(0, 0, W, H, red);
+        it.print(CX, 6, id(font_small), red, TextAlign::TOP_CENTER, "FACTORY");
+        it.print(CX, 14, id(font_small), red, TextAlign::TOP_CENTER, "RESET IN");
+        it.printf(CX, 25, id(font_large), white, TextAlign::TOP_CENTER, "%d", std::max(left, 0));
+        it.print(CX, 46, id(font_small), grey, TextAlign::TOP_CENTER, "RELEASE TO");
+        it.print(CX, 54, id(font_small), grey, TextAlign::TOP_CENTER, "CANCEL");
+        return;
+      }
+
+      // ---- not on Wi-Fi: setup / connecting screens ---------------------------
+      if (!id(wifi_component).is_connected()) {
+        if (id(provisioning_closed)) {
+          it.print(CX, 8, id(font_small), amber, TextAlign::TOP_CENTER, "SETUP");
+          it.print(CX, 16, id(font_small), amber, TextAlign::TOP_CENTER, "TIMED OUT");
+          it.print(CX, 34, id(font_small), grey, TextAlign::TOP_CENTER, "UNPLUG AND");
+          it.print(CX, 42, id(font_small), grey, TextAlign::TOP_CENTER, "PLUG IN TO");
+          it.print(CX, 50, id(font_small), grey, TextAlign::TOP_CENTER, "TRY AGAIN");
+          return;
+        }
+        if (id(wifi_component).is_ap_active()) {
+          // Alternate between written instructions and a Wi-Fi QR code.
+          if ((now / 8000) % 2 == 1) {
+            // QR needs dark modules on a light field: light the background and
+            // leave the modules unlit. Dimmed to keep current draw sane.
+            it.filled_rectangle(0, 0, W, H, Color(90, 90, 90));
+            it.qr_code(3, 3, id(setup_qr), Color(0, 0, 0), 2);
+            return;
+          }
+          it.print(CX, 1, id(font_medium), theme, TextAlign::TOP_CENTER, "SETUP");
+          it.print(CX, 15, id(font_small), grey, TextAlign::TOP_CENTER, "JOIN WI-FI");
+          marquee(id(font_medium), "Nodex Matrix Setup", 22, white);
+          it.print(CX, 40, id(font_small), grey, TextAlign::TOP_CENTER, "OR SCAN QR /");
+          it.print(CX, 48, id(font_small), grey, TextAlign::TOP_CENTER, "OPEN");
+          it.print(CX, 56, id(font_small), white, TextAlign::TOP_CENTER, "192.168.4.1");
+          return;
+        }
+        // Station configured but not (yet) connected.
+        it.print(CX, 18, id(font_small), grey, TextAlign::TOP_CENTER, "CONNECTING");
+        for (int i = 0; i < 3; i++) {
+          const bool lit = ((now / 300) % 3) == (uint32_t) i;
+          it.filled_rectangle(CX - 8 + i * 7, 32, 3, 3, lit ? theme : scale(theme, 0.2f));
+        }
+        return;
+      }
+
+      // ---- just connected: show address until Home Assistant picks it up -----
+      if (id(connected_at) != 0 && now - id(connected_at) < 10000 && !id(api_server)->is_connected()) {
+        it.print(CX, 6, id(font_small), theme, TextAlign::TOP_CENTER, "CONNECTED");
+        char ip[network::IP_ADDRESS_BUFFER_SIZE] = "";
+        for (auto &addr : id(wifi_component).wifi_sta_ip_addresses()) {
+          if (addr.is_set() && addr.is_ip4()) {
+            addr.str_to(ip);
+            break;
+          }
+        }
+        it.print(CX, 18, id(font_small), white, TextAlign::TOP_CENTER, ip);
+        it.print(CX, 36, id(font_small), grey, TextAlign::TOP_CENTER, "ADD ME IN");
+        it.print(CX, 44, id(font_small), grey, TextAlign::TOP_CENTER, "HOME");
+        it.print(CX, 52, id(font_small), grey, TextAlign::TOP_CENTER, "ASSISTANT");
+        return;
+      }
+
+      // ---- notification overlay ----------------------------------------------
+      if (id(notify_until) != 0 && (int32_t) (id(notify_until) - now) > 0) {
+        it.rectangle(0, 0, W, H, theme);
+        it.rectangle(1, 1, W - 2, H - 2, scale(theme, 0.25f));
+        marquee(id(font_large), id(notify_text), (H - 21) / 2, white);
+        return;
+      }
+
+      // ---- normal screens ------------------------------------------------------
+      ESPTime t = id(ha_time).now();
+      if (!t.is_valid())
+        t = id(sntp_time).now();
+      const bool twelve = id(clock_format).current_option() == std::string("12-hour");
+      const std::string msg = id(message_text).state;
+
+      auto time_str = [&]() -> std::string {
+        if (!t.is_valid())
+          return "--:--";
+        std::string s = t.strftime(twelve ? "%l:%M" : "%H:%M");
+        while (!s.empty() && s.front() == ' ')
+          s.erase(s.begin());
+        return s;
+      };
+
+      bool have_tiles = false;
+      for (size_t i = 0; i < id(tile_labels).size(); i++)
+        have_tiles |= !id(tile_labels)[i].empty() || !id(tile_values)[i].empty();
+
+      auto draw_info = [&]() {
+        it.print(CX, 1, id(font_small), theme, TextAlign::TOP_CENTER, upper(id(info_title)).c_str());
+        it.horizontal_line(2, 8, W - 4, scale(theme, 0.3f));
+        if (!have_tiles) {
+          it.print(CX, 28, id(font_small), grey, TextAlign::TOP_CENTER, "NO DATA YET");
+          return;
+        }
+        int y = 11;
+        for (size_t i = 0; i < id(tile_labels).size(); i++) {
+          const std::string &label = id(tile_labels)[i];
+          const std::string &value = id(tile_values)[i];
+          if (label.empty() && value.empty())
+            continue;
+          it.print(1, y, id(font_small), grey, TextAlign::TOP_LEFT, label.c_str());
+          it.print(W - 1, y, id(font_small), white, TextAlign::TOP_RIGHT, value.c_str());
+          y += 9;
+        }
+      };
+
+      auto draw_clock = [&]() {
+        if (t.is_valid())
+          it.print(CX, 4, id(font_small), grey, TextAlign::TOP_CENTER, upper(t.strftime("%A")).c_str());
+        it.print(CX, 16, id(font_large), theme, TextAlign::TOP_CENTER, time_str().c_str());
+        if (!t.is_valid())
+          return;
+        if (twelve)
+          it.print(W - 2, 37, id(font_small), grey, TextAlign::TOP_RIGHT, t.hour < 12 ? "AM" : "PM");
+        it.print(CX, 44, id(font_small), white, TextAlign::TOP_CENTER, upper(t.strftime("%d %b %Y")).c_str());
+        it.horizontal_line(2, H - 4, (W - 4) * t.second / 59, scale(theme, 0.5f));
+      };
+
+      const std::string screen = id(screen_mode).current_option();
+      if (screen == "Info") {
+        draw_info();
+      } else if (screen == "Rotate") {
+        // Clock and Info take turns every 10 seconds.
+        if (have_tiles && (now / 10000) % 2 == 1)
+          draw_info();
+        else
+          draw_clock();
+      } else if (screen == "Message") {
+        it.print(CX, 2, id(font_small), grey, TextAlign::TOP_CENTER, time_str().c_str());
+        marquee(id(font_large), msg.empty() ? std::string("NO MESSAGE") : msg, 22, theme);
+      } else if (screen == "Clock + Message") {
+        it.print(CX, 2, id(font_medium), theme, TextAlign::TOP_CENTER, time_str().c_str());
+        if (t.is_valid())
+          it.print(CX, 15, id(font_small), grey, TextAlign::TOP_CENTER, upper(t.strftime("%a %d %b")).c_str());
+        it.horizontal_line(4, 26, W - 8, scale(theme, 0.25f));
+        marquee(id(font_medium), msg.empty() ? std::string("-") : msg, 32, white);
+        if (t.is_valid())
+          it.horizontal_line(2, H - 3, (W - 4) * t.second / 59, scale(theme, 0.5f));
+      } else {
+        draw_clock();
+      }
+
+interval:
+  - interval: 33ms                   # ~30 fps for scrolling text
+    then:
+      - component.update: matrix
+
+output:
+  # Panel brightness, driven by the "Display" light.
+  - platform: template
+    id: panel_brightness
+    type: float
+    write_action:
+      - hub75.set_brightness:
+          id: matrix
+          brightness: !lambda "return state <= 0.0f ? 0 : (uint8_t) std::max(1.0f, state * 255.0f);"
+  # Theme colour channels, driven by the "Theme colour" light.
+  - platform: template
+    id: theme_red
+    type: float
+    write_action:
+      - globals.set:
+          id: theme_r
+          value: !lambda return state;
+  - platform: template
+    id: theme_green
+    type: float
+    write_action:
+      - globals.set:
+          id: theme_g
+          value: !lambda return state;
+  - platform: template
+    id: theme_blue
+    type: float
+    write_action:
+      - globals.set:
+          id: theme_b
+          value: !lambda return state;
+
+light:
+  - platform: monochromatic
+    id: display_light
+    name: Display
+    icon: mdi:led-strip
+    output: panel_brightness
+    gamma_correct: 2.2
+    default_transition_length: 250ms
+    restore_mode: RESTORE_DEFAULT_ON
+    initial_state:
+      state: true
+      brightness: 50%
+  - platform: rgb
+    id: theme_light
+    name: Theme colour
+    icon: mdi:palette
+    red: theme_red
+    green: theme_green
+    blue: theme_blue
+    gamma_correct: 1.0               # the panel driver applies its own gamma
+    default_transition_length: 0s
+    restore_mode: RESTORE_DEFAULT_ON
+    initial_state:
+      state: true
+      red: 0%
+      green: 75%
+      blue: 100%
+  - platform: esp32_rmt_led_strip
+    id: status_pixel
+    name: Status LED
+    icon: mdi:led-on
+    pin: GPIO4
+    num_leds: 1
+    chipset: WS2812
+    channel_colors: GRB
+    restore_mode: ALWAYS_OFF
+    entity_category: config
+    disabled_by_default: true
+
+status_led:
+  pin: GPIO13
+
+# ---------------------------------------------------------------- settings
+select:
+  - platform: template
+    id: screen_mode
+    name: Screen
+    icon: mdi:monitor-dashboard
+    options:
+      - Clock
+      - Info
+      - Rotate
+      - Clock + Message
+      - Message
+    initial_option: Clock
+    optimistic: true
+    restore_value: true
+  - platform: template
+    id: clock_format
+    name: Clock format
+    icon: mdi:clock-digital
+    entity_category: config
+    options:
+      - 24-hour
+      - 12-hour
+    initial_option: 24-hour
+    optimistic: true
+    restore_value: true
+
+text:
+  - platform: template
+    id: message_text
+    name: Message
+    icon: mdi:message-text
+    mode: text
+    max_length: 255
+    initial_value: "Hello from Nodex!"
+    optimistic: true
+    restore_value: true
+
+# ---------------------------------------------------------------- buttons
+event:
+  - platform: template
+    id: up_button_event
+    name: Up button
+    device_class: button
+    event_types:
+      - single_press
+      - long_press
+  - platform: template
+    id: down_button_event
+    name: Down button
+    device_class: button
+    event_types:
+      - single_press
+
+binary_sensor:
+  # UP: press = next screen, hold 1s = display on/off.
+  - platform: gpio
+    id: button_up
+    internal: true
+    pin:
+      number: GPIO6
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    filters:
+      - delayed_on: 10ms
+      - delayed_off: 10ms
+    on_multi_click:
+      - timing:
+          - ON for at most 700ms
+          - OFF for at least 50ms
+        then:
+          - event.trigger:
+              id: up_button_event
+              event_type: single_press
+          - select.next:
+              id: screen_mode
+              cycle: true
+      - timing:
+          - ON for at least 1s
+        then:
+          - event.trigger:
+              id: up_button_event
+              event_type: long_press
+          - light.toggle: display_light
+
+  # DOWN: press = step brightness, hold 10s = factory reset.
+  - platform: gpio
+    id: button_down
+    internal: true
+    pin:
+      number: GPIO7
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    filters:
+      - delayed_on: 10ms
+      - delayed_off: 10ms
+    on_press:
+      - lambda: id(down_held_since) = millis();
+    on_release:
+      - lambda: id(down_held_since) = 0;
+    on_multi_click:
+      - timing:
+          - ON for at most 700ms
+          - OFF for at least 50ms
+        then:
+          - event.trigger:
+              id: down_button_event
+              event_type: single_press
+          - light.turn_on:
+              id: display_light
+              brightness: !lambda |-
+                const float steps[] = {0.15f, 0.35f, 0.6f, 1.0f};
+                auto v = id(display_light).remote_values;
+                const float cur = v.is_on() ? v.get_brightness() : 0.0f;
+                for (float s : steps)
+                  if (s > cur + 0.01f)
+                    return s;
+                return steps[0];
+      - timing:
+          - ON for at least 10s
+        then:
+          - logger.log:
+              level: WARN
+              format: "DOWN held for 10s: factory reset"
+          - button.press: factory_reset_button
+
+  - platform: status
+    name: Status
+    entity_category: diagnostic
+
+button:
+  - platform: restart
+    name: Restart
+    entity_category: config
+  - platform: safe_mode
+    name: Safe mode boot
+    entity_category: config
+  - platform: factory_reset
+    id: factory_reset_button
+    name: Factory reset
+    entity_category: config
+
+# ---------------------------------------------------------------- diagnostics
+debug:
+  update_interval: 60s
+
+sensor:
+  - platform: wifi_signal
+    name: Wi-Fi signal
+    update_interval: 60s
+    entity_category: diagnostic
+  - platform: uptime
+    name: Uptime
+    update_interval: 60s
+    entity_category: diagnostic
+  - platform: internal_temperature
+    name: Internal temperature
+    update_interval: 60s
+    entity_category: diagnostic
+  - platform: debug
+    free:
+      name: Free heap
+      entity_category: diagnostic
+      disabled_by_default: true
+    block:
+      name: Largest free block
+      entity_category: diagnostic
+      disabled_by_default: true
+    psram:
+      name: Free PSRAM
+      entity_category: diagnostic
+      disabled_by_default: true
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: IP address
+      entity_category: diagnostic
+    ssid:
+      name: Connected SSID
+      entity_category: diagnostic
+  - platform: version
+    name: ESPHome version
+    hide_timestamp: true
+    entity_category: diagnostic

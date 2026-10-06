@@ -1,0 +1,69 @@
+# Home Assistant automation: Octopus Energy readings on the Nodex Matrix "Info" screen.
+#
+# Replace the <...> parts with your own Octopus Energy sensor IDs, then:
+# Settings -> Automations & scenes -> Create automation -> ... -> Edit in YAML, paste this.
+# Then set the matrix's "Screen" to Info (or Rotate to alternate with the clock).
+#
+# The actions are named after the device: esphome.<device name>_set_tile, with dashes as
+# underscores. Change "nodex_matrix_a1b2c3" below if your unit has a different suffix.
+
+alias: Nodex Matrix - energy on display
+description: Pushes Octopus Energy readings to the Nodex Matrix Info screen.
+mode: single
+triggers:
+  - trigger: time_pattern
+    seconds: "/30"
+  - trigger: homeassistant
+    event: start
+variables:
+  elec: sensor.octopus_energy_electricity_<METER_SERIAL>_<MPAN>
+  gas: sensor.octopus_energy_gas_<METER_SERIAL>_<MPRN>
+actions:
+  - action: esphome.nodex_matrix_a1b2c3_set_info_title
+    data:
+      title: Energy
+  - action: esphome.nodex_matrix_a1b2c3_set_tile
+    data:
+      index: 0
+      label: NOW
+      value: >-
+        {%- set w = states(elec ~ '_current_demand') -%}
+        {%- if not is_number(w) -%}--
+        {%- elif w | float >= 1000 -%}{{ '%.2fkW' | format(w | float / 1000) }}
+        {%- else -%}{{ '%dW' | format(w | float | round(0)) }}
+        {%- endif %}
+  - action: esphome.nodex_matrix_a1b2c3_set_tile
+    data:
+      index: 1
+      label: ELEC
+      value: >-
+        {%- set v = states(elec ~ '_current_accumulative_consumption') -%}
+        {{ '%.1fkWh' | format(v | float) if is_number(v) else '--' }}
+  - action: esphome.nodex_matrix_a1b2c3_set_tile
+    data:
+      index: 2
+      label: ELEC COST
+      value: >-
+        {%- set v = states(elec ~ '_current_accumulative_cost') -%}
+        {{ '£%.2f' | format(v | float) if is_number(v) else '--' }}
+  - action: esphome.nodex_matrix_a1b2c3_set_tile
+    data:
+      index: 3
+      label: RATE
+      value: >-
+        {%- set v = states(elec ~ '_current_rate') -%}
+        {{ '%.1fp' | format(v | float * 100) if is_number(v) else '--' }}
+  - action: esphome.nodex_matrix_a1b2c3_set_tile
+    data:
+      index: 4
+      label: GAS
+      value: >-
+        {%- set v = states(gas ~ '_current_accumulative_consumption_kwh') -%}
+        {{ '%.1fkWh' | format(v | float) if is_number(v) else '--' }}
+  - action: esphome.nodex_matrix_a1b2c3_set_tile
+    data:
+      index: 5
+      label: GAS COST
+      value: >-
+        {%- set v = states(gas ~ '_current_accumulative_cost') -%}
+        {{ '£%.2f' | format(v | float) if is_number(v) else '--' }}
